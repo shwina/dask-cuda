@@ -14,6 +14,8 @@ import distributed  # noqa: required for dask.config.get("distributed.comm.ucx")
 from dask.config import canonical_name
 from dask.utils import parse_bytes
 from distributed import Worker, wait
+import rmm
+import time
 
 try:
     from nvtx import annotate as nvtx_annotate
@@ -24,6 +26,8 @@ except ImportError:
     @contextmanager
     def nvtx_annotate(message=None, color="blue", domain=None):
         yield
+
+import rmm
 
 
 try:
@@ -96,9 +100,27 @@ class RMMSetup:
             )
         if self.rmm_track_allocations:
             mr = rmm.mr.get_current_device_resource()
-            rmm.mr.set_current_device_resource(
-                rmm.mr.TrackingResourceAdaptor(mr)
-            )
+            rmm.mr.set_current_device_resource(rmm.mr.TrackingResourceAdaptor(mr))
+
+
+class CustomMemoryResource(rmm.mr.CallbackMemoryResource):
+    def __init__(self, upstream_mr):
+        self.upstream_mr = upstream_mr
+        self._allocated_bytes = 0
+        super().__init__(self.allocate, self.deallocate)
+
+    def allocate(self, size):
+        self._allocated_bytes += size
+        time.sleep(0.01)
+        return self.upstream_mr.allocate(size)
+
+    def deallocate(self, ptr, size):
+        self._allocated_bytes -= size
+        time.sleep(0.01)
+        return self.upstream_mr.deallocate(ptr, size)
+
+    def get_allocated_bytes(self):
+        return self._allocated_bytes
 
 
 def unpack_bitmask(x, mask_bits=64):
