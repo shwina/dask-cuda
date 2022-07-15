@@ -4,6 +4,7 @@ import inspect
 from collections import defaultdict
 from operator import getitem
 from typing import Dict, List, Optional
+import gc
 
 from toolz import first
 
@@ -20,6 +21,10 @@ from distributed.protocol import nested_deserialize, to_serialize
 
 from ...proxify_host_file import ProxyManager
 from .. import comms
+
+def get_data_spillability(dask_worker):
+    import cudf
+    return str(cudf.core.spill_manager.global_manager._manager)
 
 
 async def send(eps, rank_to_out_parts_list: Dict[int, List[List[DataFrame]]]):
@@ -97,6 +102,9 @@ def sort_in_parts(
         rank_to_out_parts_list[rank] = [out_part_id_to_dataframes[i] for i in part_ids]
     del out_part_id_to_dataframes
 
+    print(get_data_spillability(1))
+    print("About to concat")
+
     # Concatenate all dataframes of the same output partition.
     if concat_dfs_of_same_output_partition:
         for rank in rank_to_out_part_ids.keys():
@@ -107,6 +115,9 @@ def sort_in_parts(
                             rank_to_out_parts_list[rank][i], ignore_index=ignore_index
                         )
                     ]
+    print(get_data_spillability(1))
+    print(" concat")
+
     return rank_to_out_parts_list
 
 
@@ -163,6 +174,8 @@ async def local_shuffle(
     else:
         concat = dd_concat
 
+    print(get_data_spillability(1))
+    print("About to sort")
     rank_to_out_parts_list = sort_in_parts(
         in_parts,
         rank_to_out_part_ids,
@@ -170,17 +183,32 @@ async def local_shuffle(
         concat_dfs_of_same_output_partition=True,
         concat=concat,
     )
+    print("before")
+    print(get_data_spillability(1))
+    del in_parts
+    gc.collect()
+    print("after")
+    print(get_data_spillability(1))
+    print("About to communicate")
 
     # Communicate all the dataframe-partitions all-to-all. The result is
     # `out_parts_list` that for each worker and for each output partition
     # contains a list of dataframes received.
+    print(len(rank_to_out_parts_list))
     out_parts_list: List[List[List[DataFrame]]] = []
     futures = []
-    if myrank in rank_to_out_parts_list:
-        futures.append(recv(eps, in_nparts, out_parts_list))
     if myrank in in_nparts:
         futures.append(send(eps, rank_to_out_parts_list))
     await asyncio.gather(*futures)
+
+    print("Finsihed sending")
+    futures = []
+    if myrank in rank_to_out_parts_list:
+        futures.append(recv(eps, in_nparts, out_parts_list))
+    await asyncio.gather(*futures)
+    print("Finsihed receiving")
+
+    print(get_data_spillability(1))
 
     # At this point `send()` should have pop'ed all output partitions
     # beside the partitions owned be `myrank`.
@@ -199,6 +227,8 @@ async def local_shuffle(
             ret.append(concat(dfs, ignore_index=ignore_index))
         else:
             ret.append(dfs[0])
+    print(get_data_spillability(1))
+    print("exiting local shuffle")
     return ret
 
 
@@ -261,6 +291,9 @@ def shuffle(
     df = df.persist()  # Making sure optimizations are apply on the existing graph
     dsk = dict(df.__dask_graph__())
     output_keys = []
+
+
+    print(c.client.run(get_data_spillability))
     for input_key in df.__dask_keys__():
         output_key = (name, input_key[1])
         dsk[output_key] = (
@@ -274,15 +307,18 @@ def shuffle(
             npartitions,
         )
         output_keys.append(output_key)
-
+    print(c.client.run(get_data_spillability))
     # Compute `df_groups`, which is a list of futures, one future per partition in `df`.
     # Each future points to a dict of length `df.npartitions` that maps each
     # partition-id to a DataFrame.
     df_groups = compute_as_if_collection(type(df), dsk, output_keys, sync=False)
     wait(df_groups)
+    print(c.client.run(get_data_spillability))
+
     for f in df_groups:  # Check for errors
         if f.status == "error":
             f.result()  # raise exception
+
 
     # Step (b): find out which workers has what part of `df_groups`,
     #           find the number of output each worker should have,
@@ -311,6 +347,9 @@ def shuffle(
     for rank, i in zip(workers_sorted, range(div * len(workers), npartitions)):
         rank_to_out_part_ids[rank].append(i)
 
+    distributed.wait(list(in_parts.values()))
+    print(c.client.run(get_data_spillability))
+
     # Run `local_shuffle()` on each worker
     result_futures = {}
     for rank, worker in enumerate(c.worker_addresses):
@@ -319,11 +358,13 @@ def shuffle(
                 worker,
                 local_shuffle,
                 in_nparts,
-                in_parts[worker],
+                in_parts.pop(worker),
                 rank_to_out_part_ids,
                 ignore_index,
             )
     distributed.wait(list(result_futures.values()))
+    print(c.client.run(get_data_spillability))
+
     del df_groups
 
     # Step (c): extract individual dataframe-partitions
@@ -341,7 +382,9 @@ def shuffle(
     assert meta is not None
 
     divs = [None] * (len(dsk) + 1)
-    return new_dd_object(dsk, name, meta, divs).persist()
+    result  =  new_dd_object(dsk, name, meta, divs).persist()
+    print(c.client.run(get_data_spillability))
+    return result
 
 
 def get_rearrange_by_column_tasks_wrapper(func):
